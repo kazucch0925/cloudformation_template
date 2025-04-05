@@ -314,6 +314,7 @@ Resources:
               StringEquals:
                 'AWS:SourceOwner': !Ref 'AWS::AccountId'
 
+  # メール通知用のSNSサブスクリプション（raw形式で送信し、カスタムサブジェクトを使用）
   EmailSubscription:
     Type: 'AWS::SNS::Subscription'
     Properties:
@@ -323,7 +324,210 @@ Resources:
       FilterPolicy:
         source:
           - 'aws.codepipeline'
+      RawMessageDelivery: true
+
+  # メール通知用のSNSサブジェクト変換Lambda
+  EmailNotificationForwarder:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-email-forwarder"
+      Handler: index.handler
+      Role: !GetAtt EmailNotificationForwarderRole.Arn
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          EMAIL_SNS_TOPIC_ARN: !Ref PipelineNotificationTopic
+          REGION: !Ref Region
+      Code:
+        ZipFile: |
+          const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+          
+          // SNSクライアントの初期化
+          const snsClient = new SNSClient({ region: process.env.REGION });
+          
+          exports.handler = async (event) => {
+              console.log('Event received:', JSON.stringify(event, null, 2));
+              
+              try {
+                  if (!event.Records || !event.Records[0] || !event.Records[0].Sns) {
+                      console.error('Invalid event structure:', JSON.stringify(event));
+                      return { statusCode: 400, body: 'Invalid event structure' };
+                  }
+
+                  // SNSメッセージを解析
+                  const snsMessage = event.Records[0].Sns;
+                  const messageStr = snsMessage.Message;
+                  
+                  let parsedMessage;
+                  try {
+                      // JSONの場合はパース
+                      parsedMessage = JSON.parse(messageStr);
+                  } catch (e) {
+                      console.error('JSONパースエラー:', e);
+                      return { statusCode: 200, body: 'Non-JSON message ignored' };
+                  }
+                  
+                  // パイプラインの状態を取得
+                  const state = parsedMessage.detail?.state;
+                  const pipelineName = parsedMessage.detail?.pipeline || 
+                                      parsedMessage.resources?.[0]?.split(':').pop() ||
+                                      '不明なパイプライン';
+                  
+                  // 状態に応じたメッセージを作成
+                  let subject, message;
+                  const timestamp = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+                  
+                  if (state === 'STARTED') {
+                      subject = `【開始】パイプライン「${pipelineName}」の実行が開始されました`;
+                      message = `
+===========================================
+パイプライン実行開始
+===========================================
+
+パイプライン「${pipelineName}」の実行が開始されました。
+
+時刻: ${timestamp}
+`;
+                  } else if (state === 'SUCCEEDED') {
+                      subject = `【成功】パイプライン「${pipelineName}」の実行が成功しました`;
+                      message = `
+===========================================
+パイプライン実行成功
+===========================================
+
+パイプライン「${pipelineName}」の実行が正常に完了しました。
+
+時刻: ${timestamp}
+`;
+                  } else if (state === 'FAILED') {
+                      // 失敗した場所の情報を抽出
+                      const failedStage = parsedMessage.detail?.stage || '不明';
+                      const failedAction = parsedMessage.detail?.action || '不明';
+                      let failureInfo = '';
+                      
+                      if (failedStage !== '不明') {
+                          failureInfo = `ステージ「${failedStage}」`;
+                          if (failedAction !== '不明') {
+                              failureInfo += `のアクション「${failedAction}」`;
+                          }
+                      }
+                      
+                      subject = `【失敗】パイプライン「${pipelineName}」の実行が失敗しました`;
+                      message = `
+===========================================
+パイプライン実行失敗
+===========================================
+
+パイプライン「${pipelineName}」の実行が失敗しました。
+
+`;
+                      if (failureInfo) {
+                          message += `失敗箇所: ${failureInfo}\n\n`;
+                      }
+                      
+                      message += `時刻: ${timestamp}`;
+                  } else {
+                      // 対象外の状態はスキップ
+                      console.log('対象外の状態のため通知をスキップします:', state);
+                      return { statusCode: 200, body: 'State ignored' };
+                  }
+                  
+                  // 整形したメッセージをSNSに再発行
+                  try {
+                      const params = {
+                          TopicArn: process.env.EMAIL_SNS_TOPIC_ARN,
+                          Subject: subject,
+                          Message: message,
+                          MessageAttributes: {
+                              'source': {
+                                  DataType: 'String',
+                                  StringValue: 'aws.codepipeline.formatted'
+                              }
+                          }
+                      };
+                      
+                      const command = new PublishCommand(params);
+                      const response = await snsClient.send(command);
+                      console.log('SNS message published successfully:', response);
+                      return { statusCode: 200, body: 'Message forwarded successfully' };
+                  } catch (error) {
+                      console.error('SNS publish error:', error);
+                      throw error;
+                  }
+              } catch (error) {
+                  console.error('Error processing message:', error);
+                  return { statusCode: 500, body: `Error: ${error.message}` };
+              }
+          };
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-EmailNotificationForwarder"
+        - Key: Project
+          Value: !FindInMap [TagMap, DefaultTags, Project]
+        - Key: Environment
+          Value: !FindInMap [TagMap, DefaultTags, Environment]
+
+  EmailNotificationForwarderRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'EmailForwarderPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref PipelineNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-EmailNotificationForwarderRole"
+        - Key: Project
+          Value: !FindInMap [TagMap, DefaultTags, Project]
+        - Key: Environment
+          Value: !FindInMap [TagMap, DefaultTags, Environment]
+
+  EmailNotificationForwarderSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref PipelineNotificationTopic
+      Endpoint: !GetAtt EmailNotificationForwarder.Arn
+      FilterPolicy:
+        source:
+          - 'aws.codepipeline'
           - 'aws.codestar-notifications'
+
+  EmailNotificationForwarderPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref EmailNotificationForwarder
+      Principal: 'sns.amazonaws.com'
+      SourceArn: !Ref PipelineNotificationTopic
+
+  # EmailSubscriptionで受信するメッセージを整形済みのものだけに限定
+  FormattedEmailSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PipelineNotificationTopic
+      Endpoint: !Ref NotificationEmail
+      FilterPolicy:
+        source:
+          - 'aws.codepipeline.formatted'
 
   SlackNotificationFunction:
     Type: 'AWS::Lambda::Function'
