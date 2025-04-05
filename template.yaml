@@ -323,7 +323,6 @@ Resources:
       FilterPolicy:
         source:
           - 'aws.codepipeline'
-          - 'aws.codebuild'
           - 'aws.codestar-notifications'
 
   SlackNotificationFunction:
@@ -363,10 +362,8 @@ Resources:
                   // SNSメッセージを解析
                   const snsMessage = event.Records[0].Sns;
                   const messageStr = snsMessage.Message;
-                  const subject = snsMessage.Subject || 'CI/CD Pipeline Notification';
                   
                   console.log('SNS Message:', messageStr);
-                  console.log('Subject:', subject);
                   
                   let parsedMessage;
                   try {
@@ -374,44 +371,109 @@ Resources:
                       parsedMessage = JSON.parse(messageStr);
                   } catch (e) {
                       // テキストメッセージの場合はそのまま使用
+                      console.error('JSONパースエラー:', e);
                       parsedMessage = messageStr;
+                      return {
+                          statusCode: 200,
+                          body: 'Non-JSON message ignored'
+                      };
                   }
                   
-                  const messageText = typeof parsedMessage === 'object' 
-                      ? JSON.stringify(parsedMessage, null, 2) 
-                      : parsedMessage;
+                  // メッセージの詳細を取得
+                  const detailType = parsedMessage['detail-type'];
+                  const source = parsedMessage.source;
+                  const state = parsedMessage.detail?.state;
+                  const pipelineName = parsedMessage.detail?.pipeline || 
+                                      parsedMessage.resources?.[0]?.split(':').pop() ||
+                                      '不明なパイプライン';
                   
-                  let color = '#36a64f'; // デフォルトは緑色
-                  const messageContent = messageText.toLowerCase();
-                  if (messageContent.includes('failed') || messageContent.includes('failure') || messageContent.includes('失敗')) {
-                      color = '#ff0000'; // 失敗は赤色
-                  } else if (messageContent.includes('started') || messageContent.includes('in progress') || messageContent.includes('開始')) {
-                      color = '#ffcc00'; // 開始は黄色
+                  console.log(`Source: ${source}, DetailType: ${detailType}, State: ${state}, Pipeline: ${pipelineName}`);
+                  
+                  // フィルタリング - パイプライン実行のステータス通知に絞る
+                  const isCodePipelineEvent = source === 'aws.codepipeline' || 
+                                              (source === 'aws.codestar-notifications' && 
+                                               detailType === 'CodePipeline Pipeline Execution State Change');
+                                               
+                  if (!isCodePipelineEvent) {
+                      console.log('イベントタイプが対象外のため通知をスキップします:', source, detailType);
+                      return {
+                          statusCode: 200,
+                          body: 'Event type ignored'
+                      };
                   }
                   
-                  // テスト完了の通知の場合、S3からテスト結果のURLを取得
-                  let testReportText = '';
-                  if ((messageContent.includes('succeeded') || messageContent.includes('failed')) && 
-                      (subject.includes('Test') || subject.includes('test') || messageContent.includes('test'))) {
+                  // シンプルなメッセージを作成
+                  let title, message, color;
+                  
+                  if (state === 'STARTED') {
+                      title = `📣 パイプライン実行開始`;
+                      message = `パイプライン「${pipelineName}」の実行が開始されました`;
+                      color = '#3AA3E3'; // 青色
+                  } else if (state === 'SUCCEEDED') {
+                      title = `✅ パイプライン実行成功`;
+                      message = `パイプライン「${pipelineName}」の実行が正常に完了しました`;
+                      color = '#36a64f'; // 緑色
+                      
+                      // テスト結果レポートのリンク取得（テストステージがある場合）
                       try {
                           const reportUrl = await getLatestTestReportUrl();
                           if (reportUrl) {
-                              testReportText = `\n\n*テスト結果レポート*: <${reportUrl}|ここをクリックして確認する>`;
+                              message += `\n\n*テスト結果レポート*: <${reportUrl}|こちらから確認できます>`;
                           }
                       } catch (error) {
                           console.error('テストレポートURL取得エラー:', error);
                       }
+                  } else if (state === 'FAILED') {
+                      title = `❌ パイプライン実行失敗`;
+                      message = `パイプライン「${pipelineName}」の実行が失敗しました`;
+                      
+                      // 失敗した場所の情報を抽出（可能な場合）
+                      const failedStage = parsedMessage.detail?.stage || '不明';
+                      const failedAction = parsedMessage.detail?.action || '不明';
+                      if (failedStage !== '不明') {
+                          message += `\n\n*失敗箇所*: ステージ「${failedStage}」`;
+                          if (failedAction !== '不明') {
+                              message += `のアクション「${failedAction}」`;
+                          }
+                      }
+                      
+                      color = '#ff0000'; // 赤色
+                  } else {
+                      console.log('対象外の状態のため通知をスキップします:', state);
+                      return {
+                          statusCode: 200,
+                          body: 'State ignored'
+                      };
                   }
                   
                   // Slackメッセージを構築
                   const slackMessage = {
-                      text: `*${subject}*`,
-                      attachments: [{
-                          color: color,
-                          text: messageText + testReportText,
-                          footer: 'AWS CodePipeline Notification',
-                          ts: Math.floor(Date.now() / 1000)
-                      }]
+                      blocks: [
+                          {
+                              type: "header",
+                              text: {
+                                  type: "plain_text",
+                                  text: title,
+                                  emoji: true
+                              }
+                          },
+                          {
+                              type: "section",
+                              text: {
+                                  type: "mrkdwn",
+                                  text: message
+                              }
+                          },
+                          {
+                              type: "context",
+                              elements: [
+                                  {
+                                      type: "mrkdwn",
+                                      text: `*時刻*: ${new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}`
+                                  }
+                              ]
+                          }
+                      ]
                   };
                   
                   console.log('Slack message:', JSON.stringify(slackMessage));
@@ -541,6 +603,10 @@ Resources:
       Protocol: lambda
       TopicArn: !Ref PipelineNotificationTopic
       Endpoint: !GetAtt SlackNotificationFunction.Arn
+      FilterPolicy:
+        source:
+          - 'aws.codepipeline'
+          - 'aws.codestar-notifications'
 
   LambdaPermission:
     Type: 'AWS::Lambda::Permission'
@@ -936,10 +1002,6 @@ Resources:
         - codepipeline-pipeline-pipeline-execution-failed
         - codepipeline-pipeline-pipeline-execution-succeeded
         - codepipeline-pipeline-pipeline-execution-started
-        - codepipeline-pipeline-stage-execution-failed
-        - codepipeline-pipeline-stage-execution-succeeded
-        - codepipeline-pipeline-action-execution-failed
-        - codepipeline-pipeline-action-execution-succeeded
       Resource: !Sub "arn:aws:codepipeline:${Region}:${AccountID}:${Pipeline}"
       Targets:
         - TargetType: SNS
@@ -952,8 +1014,6 @@ Resources:
       DetailType: FULL
       EventTypeIds:
         - codebuild-project-build-state-failed
-        - codebuild-project-build-state-succeeded
-        - codebuild-project-build-state-in-progress
       Resource: !Sub "arn:aws:codebuild:${Region}:${AccountID}:project/${BuildProject}"
       Targets:
         - TargetType: SNS
@@ -966,8 +1026,6 @@ Resources:
       DetailType: FULL
       EventTypeIds:
         - codebuild-project-build-state-failed
-        - codebuild-project-build-state-succeeded
-        - codebuild-project-build-state-in-progress
       Resource: !Sub "arn:aws:codebuild:${Region}:${AccountID}:project/${TestProjectName}"
       Targets:
         - TargetType: SNS
