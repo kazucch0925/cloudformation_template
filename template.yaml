@@ -342,10 +342,10 @@ Resources:
       Code:
         ZipFile: |
           const https = require('https');
-          const AWS = require('aws-sdk');
+          const { S3Client, ListObjectsV2Command } = require('@aws-sdk/client-s3');
           
           // S3クライアントの初期化
-          const s3 = new AWS.S3({ region: process.env.REGION });
+          const s3Client = new S3Client({ region: process.env.REGION });
           
           exports.handler = async (event) => {
               console.log('Event received:', JSON.stringify(event, null, 2));
@@ -519,20 +519,20 @@ Resources:
                   }
                   
                   // S3バケットの最新のオブジェクトを取得
-                  const params = {
+                  const command = new ListObjectsV2Command({
                       Bucket: bucketName,
                       Prefix: 'report-',  // テストレポートのプレフィックスがあれば指定
                       MaxKeys: 10
-                  };
+                  });
                   
-                  const data = await s3.listObjectsV2(params).promise();
-                  if (!data.Contents || data.Contents.length === 0) {
+                  const response = await s3Client.send(command);
+                  if (!response.Contents || response.Contents.length === 0) {
                       console.log('テストレポートが見つかりませんでした');
                       return null;
                   }
                   
                   // 最新のフォルダを特定（LastModifiedで並べ替え）
-                  const latestObject = data.Contents.sort((a, b) => 
+                  const latestObject = response.Contents.sort((a, b) => 
                       new Date(b.LastModified) - new Date(a.LastModified)
                   )[0];
                   
