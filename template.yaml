@@ -323,8 +323,7 @@ Resources:
       Endpoint: !Ref NotificationEmail
       FilterPolicy:
         source:
-          - 'aws.codepipeline'
-      RawMessageDelivery: true
+          - 'aws.codepipeline.formatted'
 
   # メール通知用のSNSサブジェクト変換Lambda
   EmailNotificationForwarder:
@@ -510,17 +509,6 @@ Resources:
       FunctionName: !Ref EmailNotificationForwarder
       Principal: 'sns.amazonaws.com'
       SourceArn: !Ref PipelineNotificationTopic
-
-  # EmailSubscriptionで受信するメッセージを整形済みのものだけに限定
-  FormattedEmailSubscription:
-    Type: 'AWS::SNS::Subscription'
-    Properties:
-      Protocol: email
-      TopicArn: !Ref PipelineNotificationTopic
-      Endpoint: !Ref NotificationEmail
-      FilterPolicy:
-        source:
-          - 'aws.codepipeline.formatted'
 
   SlackNotificationFunction:
     Type: 'AWS::Lambda::Function'
